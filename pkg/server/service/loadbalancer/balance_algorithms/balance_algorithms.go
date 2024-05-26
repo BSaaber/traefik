@@ -1,13 +1,13 @@
-package wrr
+package balance_algorithms
 
 import (
-	"container/heap"
 	"context"
 	"errors"
 	"hash/fnv"
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
@@ -18,6 +18,7 @@ type namedHandler struct {
 	name     string
 	weight   float64
 	deadline float64
+	inflight atomic.Int64
 }
 
 type stickyCookie struct {
@@ -26,6 +27,12 @@ type stickyCookie struct {
 	httpOnly bool
 	sameSite string
 	maxAge   int
+}
+
+func (h *namedHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	h.inflight.Add(1)
+	defer h.inflight.Add(-1)
+	h.Handler.ServeHTTP(w, req)
 }
 
 func convertSameSite(sameSite string) http.SameSite {
@@ -41,6 +48,18 @@ func convertSameSite(sameSite string) http.SameSite {
 	}
 }
 
+used to implement different ways of balancing
+type Strategy interface {
+
+	nextServer(status map[string]struct{}) *namedHandler
+	add(h *namedHandler)
+
+	setUp(name string, up bool)
+
+	name() string
+	len() int
+}
+
 // Balancer is a WeightedRoundRobin load balancer based on Earliest Deadline First (EDF).
 // (https://en.wikipedia.org/wiki/Earliest_deadline_first_scheduling)
 // Each pick from the schedule has the earliest deadline entry selected.
@@ -53,8 +72,6 @@ type Balancer struct {
 	handlersMu sync.RWMutex
 	// References all the handlers by name and also by the hashed value of the name.
 	handlerMap  map[string]*namedHandler
-	handlers    []*namedHandler
-	curDeadline float64
 	// status is a record of which child services of the Balancer are healthy, keyed
 	// by name of child service. A service is initially added to the map when it is
 	// created via Add, and it is later removed or added to the map as needed,
@@ -63,14 +80,25 @@ type Balancer struct {
 	// updaters is the list of hooks that are run (to update the Balancer
 	// parent(s)), whenever the Balancer status changes.
 	updaters []func(bool)
+
+	strategy Strategy
 }
 
-// New creates a new load balancer.
-func New(sticky *dynamic.Sticky, wantHealthCheck bool) *Balancer {
+func NewWeightedRoundRobin(sticky *dynamic.Sticky, wantHealthCheck bool) *Balancer {
+	return newBalancer(sticky, wantHealthCheck, newStrategyWeightedRoundRobin())
+}
+
+func NewPowerOfTwoRandomChoises(sticky *dynamic.Sticky, wantHealthCheck bool) *Balancer {
+	return newBalancer(sticky, wantHealthCheck, newStrategyPowerOfTwoRandomChoises())
+}
+
+// NewBalancer creates a new load balancer.
+func newBalancer(sticky *dynamic.Sticky, wantHealthCheck bool, strategy Strategy) *Balancer {
 	balancer := &Balancer{
 		status:           make(map[string]struct{}),
 		handlerMap:       make(map[string]*namedHandler),
 		wantsHealthCheck: wantHealthCheck,
+		strategy: strategy,
 	}
 	if sticky != nil && sticky.Cookie != nil {
 		balancer.stickyCookie = &stickyCookie{
@@ -83,37 +111,6 @@ func New(sticky *dynamic.Sticky, wantHealthCheck bool) *Balancer {
 	}
 
 	return balancer
-}
-
-// Len implements heap.Interface/sort.Interface.
-func (b *Balancer) Len() int { return len(b.handlers) }
-
-// Less implements heap.Interface/sort.Interface.
-func (b *Balancer) Less(i, j int) bool {
-	return b.handlers[i].deadline < b.handlers[j].deadline
-}
-
-// Swap implements heap.Interface/sort.Interface.
-func (b *Balancer) Swap(i, j int) {
-	b.handlers[i], b.handlers[j] = b.handlers[j], b.handlers[i]
-}
-
-// Push implements heap.Interface for pushing an item into the heap.
-func (b *Balancer) Push(x interface{}) {
-	h, ok := x.(*namedHandler)
-	if !ok {
-		return
-	}
-
-	b.handlers = append(b.handlers, h)
-}
-
-// Pop implements heap.Interface for popping an item from the heap.
-// It panics if b.Len() < 1.
-func (b *Balancer) Pop() interface{} {
-	h := b.handlers[len(b.handlers)-1]
-	b.handlers = b.handlers[0 : len(b.handlers)-1]
-	return h
 }
 
 // SetStatus sets on the balancer that its given child is now of the given
@@ -136,6 +133,8 @@ func (b *Balancer) SetStatus(ctx context.Context, childName string, up bool) {
 	} else {
 		delete(b.status, childName)
 	}
+
+	b.strategy.setUp(childName, up)
 
 	upAfter := len(b.status) > 0
 	status = "DOWN"
@@ -174,26 +173,13 @@ func (b *Balancer) nextServer() (*namedHandler, error) {
 	b.handlersMu.Lock()
 	defer b.handlersMu.Unlock()
 
-	if len(b.handlers) == 0 || len(b.status) == 0 {
+	if b.strategy.len() == 0 || len(b.status) == 0 {
 		return nil, errNoAvailableServer
 	}
 
-	var handler *namedHandler
-	for {
-		// Pick handler with closest deadline.
-		handler = heap.Pop(b).(*namedHandler)
+	handler := b.strategy.nextServer(b.status)
 
-		// curDeadline should be handler's deadline so that new added entry would have a fair competition environment with the old ones.
-		b.curDeadline = handler.deadline
-		handler.deadline += 1 / handler.weight
-
-		heap.Push(b, handler)
-		if _, ok := b.status[handler.name]; ok {
-			break
-		}
-	}
-
-	log.Debug().Msgf("Service selected by WRR: %s", handler.name)
+	log.Debug().Msgf("Service selected by strategy %q: %s", b.strategy.name(), handler.name)
 	return handler, nil
 }
 
@@ -263,8 +249,7 @@ func (b *Balancer) Add(name string, handler http.Handler, weight *int) {
 	h := &namedHandler{Handler: handler, name: name, weight: float64(w)}
 
 	b.handlersMu.Lock()
-	h.deadline = b.curDeadline + 1/h.weight
-	heap.Push(b, h)
+	b.strategy.add(h)
 	b.status[name] = struct{}{}
 	b.handlerMap[name] = h
 	b.handlerMap[hash(name)] = h

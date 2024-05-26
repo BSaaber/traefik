@@ -29,7 +29,7 @@ import (
 	"github.com/traefik/traefik/v3/pkg/server/provider"
 	"github.com/traefik/traefik/v3/pkg/server/service/loadbalancer/failover"
 	"github.com/traefik/traefik/v3/pkg/server/service/loadbalancer/mirror"
-	"github.com/traefik/traefik/v3/pkg/server/service/loadbalancer/wrr"
+	"github.com/traefik/traefik/v3/pkg/server/service/loadbalancer/balance_algorithms"
 )
 
 const defaultMaxBodySize int64 = -1
@@ -220,7 +220,7 @@ func (m *Manager) getWRRServiceHandler(ctx context.Context, serviceName string, 
 		config.Sticky.Cookie.Name = cookie.GetName(config.Sticky.Cookie.Name, serviceName)
 	}
 
-	balancer := wrr.New(config.Sticky, config.HealthCheck != nil)
+	balancer := balance_algorithms.NewWeightedRoundRobin(config.Sticky, config.HealthCheck != nil)
 	for _, service := range shuffle(config.Services, m.rand) {
 		if service.Status != nil {
 			serviceHandler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -291,7 +291,7 @@ func (m *Manager) getLoadBalancerServiceHandler(ctx context.Context, serviceName
 		return nil, err
 	}
 
-	lb := wrr.New(service.Sticky, service.HealthCheck != nil)
+	lb := balance_algorithms.NewWeightedRoundRobin(service.Sticky, service.HealthCheck != nil)
 	healthCheckTargets := make(map[string]*url.URL)
 
 	for _, server := range shuffle(service.Servers, m.rand) {
